@@ -24,14 +24,15 @@ from oscar.utils.tsv_file_ops import (tsv_writer, concat_tsv_files,
         delete_tsv_files, reorder_tsv_keys)
 from oscar.utils.misc import (mkdir, set_seed, 
         load_from_yaml_file, find_file_path_in_yaml)
-from oscar.utils.caption_evaluate import (evaluate_on_coco_caption,
+from oscar.utils.caption_evaluate import (
         ScstRewardCriterion)
 from oscar.utils.cbs import ConstraintFilter, ConstraintBoxesReader
 from oscar.utils.cbs import FiniteStateMachineBuilder
 from oscar.modeling.modeling_bert import BertForImageCaptioning
-from transformers.pytorch_transformers import BertTokenizer, BertConfig
-from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
+from pytorch_transformers import BertTokenizer, BertConfig
+from pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
 
+import wandb
 
 class CaptionTSVDataset(Dataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True, add_cluster_labels=True,add_goals=True,
@@ -104,7 +105,7 @@ class CaptionTSVDataset(Dataset):
         if self.captions:
             key2captions = {key: [] for key in self.image_keys}
             for cap in self.captions:
-                key2captions[cap['image_id']].append(cap['caption'])
+                key2captions[str(cap['image_id'])].append(cap['caption'])
             return key2captions
 
     def get_image_index(self, idx):
@@ -153,7 +154,7 @@ class CaptionTSVDataset(Dataset):
         cluster_labels = None
         cluster_ = None
         if self.add_cluster_labels:
-            cluster_labels = self.cluster_tsv.seek(img_idx)[1]
+            cluster_labels = self.cluster_tsv.seek(img_idx)[0] # mv to 0 from 1
             cluster_ = ''
             if "turn" in cluster_labels or "pan" in cluster_labels:
                 cluster_ += " turn"
@@ -167,7 +168,7 @@ class CaptionTSVDataset(Dataset):
     def get_goals(self, img_idx):
         goals = None
         if self.add_goals:
-            goals = self.goal_tsv.seek(img_idx)[1]
+            goals = self.goal_tsv.seek(img_idx)[0] # mv to 0 from 1
             goals = [float(goals[1:-2].split(',')[0]), float(goals[1:-2].split(',')[1])]
         else:
             goals = [0.0, 0.0]
@@ -531,6 +532,21 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
     model.zero_grad()
     eval_log = []
     best_score = 0
+    wandb.login(key="57f6d6de3929f9e01c595960c24b3f656bb8da66")
+    # start a new wandb run to track this script
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="assister-default",
+        
+        # track hyperparameters and run metadata
+        config={
+        "learning_rate": 0.00003,
+        "architecture": "BERT_Custom",
+        "dataset": "assister-subset",
+        "epochs": 100,
+        }
+    )
+    
     for epoch in range(int(args.num_train_epochs)):
         for step, (img_keys, batch) in enumerate(train_dataloader):
             batch = tuple(t.to(args.device) for t in batch)
@@ -553,10 +569,14 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
+            
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             global_loss += loss.item()
             global_acc += batch_acc
+            # log metrics to wandb
+            wandb.log({"loss": loss, "global acc": global_acc})
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
                 scheduler.step()
@@ -577,6 +597,20 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
                         logger.info("Perform evaluation at step: %d" % (global_step))
                         evaluate_file = evaluate(args, val_dataset, model, tokenizer,
                                 checkpoint_dir)
+                        with open(evaluate_file, 'r') as file:
+                            lines = file.readlines()
+                        confidences = []
+                        for line in lines:
+                            confidences.append(eval(line.strip().split('\t')[1])[0]['conf'])
+                        best_score = max(np.average(confidences), best_score)
+                        res = {}
+                        res['epoch'] = epoch
+                        res['global_step'] = step
+                        res['conf'] = best_score
+                        eval_log.append(res)
+                        with open(args.output_dir + '/eval_logs.json', 'w') as f:
+                            json.dump(eval_log, f)
+                        """
                         with open(evaluate_file, 'r') as f:
                             res = json.load(f)
                         best_score = max(best_score, res['CIDEr'])
@@ -585,7 +619,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
                         res['best_CIDEr'] = best_score
                         eval_log.append(res)
                         with open(args.output_dir + '/eval_logs.json', 'w') as f:
-                            json.dump(eval_log, f)
+                            json.dump(eval_log, f)"""
     return checkpoint_dir
 
 
@@ -691,18 +725,21 @@ def evaluate(args, val_dataloader, model, tokenizer, output_dir):
 
     if get_world_size() > 1:
         torch.distributed.barrier()
-    evaluate_file = get_evaluate_file(predict_file)
+    
+    #evaluate_file = get_evaluate_file(predict_file)
     if is_main_process():
+        pass
+        """
         caption_file = val_dataloader.dataset.get_caption_file_in_coco_format()
         data = val_dataloader.dataset.yaml_file.split('/')[-2]
         print(predict_file, caption_file, evaluate_file)
         if 'nocaps' not in data:
             result = evaluate_on_coco_caption(predict_file, caption_file, outfile=evaluate_file)
             logger.info('evaluation result: {}'.format(str(result)))
-            logger.info('evaluation result saved to {}'.format(evaluate_file))
+            logger.info('evaluation result saved to {}'.format(evaluate_file))"""
     if get_world_size() > 1:
         torch.distributed.barrier()
-    return evaluate_file
+    return predict_file
 
 
 def test(args, test_dataloader, model, tokenizer, predict_file):
@@ -1078,3 +1115,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
